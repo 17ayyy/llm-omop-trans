@@ -1,0 +1,4 @@
+concept_id~concept_name_zh~concept_name~domain_id~vocabulary_id~concept_class_id~model
+900000001~~Left kidney~Condition~DEMO~Clinical Finding~
+900000002~~Right kidney~Condition~DEMO~Clinical Finding~
+900000003~已有译名~Existing label~Condition~DEMO~Clinical Finding~

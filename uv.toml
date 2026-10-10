@@ -1,0 +1,6 @@
+cache-dir = ".uv-cache"
+system-certs = true
+
+[[index]]
+url = "https://pypi.org/simple"
+default = true

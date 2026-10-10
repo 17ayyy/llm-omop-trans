@@ -1,0 +1,56 @@
+# Local configuration and credentials
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!**/.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Installed environments, generated files, and tooling caches
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Real terminology inputs, snapshots, outputs, state, and logs
+/data/
+/rawdata/
+/outputs/
+/state/
+/cache/
+/tmp/
+*.csv
+*.tsv
+*.parquet
+*.duckdb
+*.db
+*.log
+*.xlsx
+*.xls
+*.zip
+*.rar
+*.7z
+!/examples/synthetic/*.csv
+
+# Local editor and OS files
+.idea/
+.vscode/
+.ipynb_checkpoints/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
