@@ -50,6 +50,11 @@ from llm_omop_trans.config import (
     StandaloneError,
     _load_runtime,
 )
+from llm_omop_trans.run_index import (
+    pilot_directories,
+    rebuild_index,
+    run_directory,
+)
 from llm_omop_trans.utils import (
     _canonical_json,
     _implementation_hash,
@@ -855,7 +860,12 @@ def _resolve_resume_semantic(
         return semantic
     if re.fullmatch(r"run-[0-9a-f]{16}", resume_run_id) is None:
         raise StandaloneError("Invalid resume run ID")
-    path = OUTPUT_ROOT / resume_run_id / "run_manifest.json"
+    path = run_directory(
+        OUTPUT_ROOT,
+        resume_run_id,
+        str(semantic.get("run_kind")),
+        resume=True,
+    ) / "run_manifest.json"
     if not path.is_file():
         raise StandaloneError("Resume run is missing manifest")
     try:
@@ -1089,10 +1099,23 @@ def _prepare_run(
     run_id = "run-" + semantic_hash[:16]
     if resume_run_id is not None and resume_run_id != run_id:
         raise StandaloneError("Resume run ID does not match current inputs")
-    run_dir = OUTPUT_ROOT / run_id
+    run_dir = run_directory(
+        OUTPUT_ROOT,
+        run_id,
+        str(semantic.get("run_kind")),
+        resume=resume_run_id is not None,
+    )
     manifest_path = run_dir / "run_manifest.json"
     state_path = run_dir / "state.duckdb"
     if resume_run_id is None and run_dir.exists():
+        raise StandaloneError(
+            f"Run already exists; use --resume-run-id {run_id}"
+        )
+    if (
+        resume_run_id is None
+        and semantic.get("run_kind") == "pilot"
+        and (OUTPUT_ROOT / run_id).exists()
+    ):
         raise StandaloneError(
             f"Run already exists; use --resume-run-id {run_id}"
         )
@@ -1104,6 +1127,7 @@ def _prepare_run(
         run_dir.mkdir(parents=True)
         manifest = {
             "run_id": run_id,
+            "requested_model": config.model,
             "semantic": semantic,
             "input_path": str(input_csv.resolve()),
             "input_row_count": total_input_rows,
@@ -1432,7 +1456,7 @@ def _validated_pilot_states(full_semantic: Mapping[str, object]) -> list[Path]:
         if key not in {"run_kind", "pilot_size", "pilot_label", "script_sha256"}
     }
     valid: list[Path] = []
-    for run_dir in sorted(OUTPUT_ROOT.glob("run-*")):
+    for run_dir in pilot_directories(OUTPUT_ROOT):
         manifest_path = run_dir / "run_manifest.json"
         state_path = run_dir / "state.duckdb"
         output_path = run_dir / "omop-trans.csv"
@@ -1768,6 +1792,11 @@ def llm_trans(
                 pilot_sources[0].parent.name if pilot_sources else None,
             )
             try:
+                rebuild_index(
+                    output_root,
+                    live_run_id=run_id,
+                    live_connection=connection,
+                )
                 if not pilot_only and resume_run_id is None and pilot_sources:
                     _seed_pilot_successes(
                         connection, pilot_sources, rows, config
@@ -1803,6 +1832,7 @@ def llm_trans(
                 )
             finally:
                 connection.close()
+                rebuild_index(output_root)
             if interrupted == "interrupted":
                 raise KeyboardInterrupt
             if interrupted is not None:

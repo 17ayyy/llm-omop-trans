@@ -13,6 +13,7 @@
 - 严格校验 UTF-8、波浪号分隔输入；精确选择词表；外发前核对同版 Concept 身份、有效期及已有中文名。
 - 每次请求只包含一个 Concept；使用固定 JSON 结构、严格解析和 14 类医学属性确定性后检；全部候选仍须专家审核。
 - 独立 Pilot 运行，每次抽取 1–20 条可发送记录；机器门禁、明确选择已审核 Pilot、正式运行复用已验证的 Pilot 成功结果。
+- Pilot 写入 `outputs/test/<run-id>/`，正式运行写入 `outputs/<run-id>/`；`outputs/run-index.json` 可按运行编号检索。
 - DuckDB 调用台账、逐次提交、CSV 导出校验和带指纹的断点续跑；已成功请求不重发。仅明确识别额度耗尽且后备模型合成探测成功时切换模型。
 - 汇总兼容的正式运行，区分 API 成功、候选生成、后检结果和处理完成。
 
@@ -67,7 +68,7 @@ Copy-Item .env.example .env
 uv run --locked llm-omop-trans translate --input .\examples\synthetic\input.csv --vocabulary-id DEMO --pilot-only --pilot-size 1 --concurrency 1 --batch-size 1
 ```
 
-命令会打印 `outputs/<run-id>/omop-trans.csv`。请查看 CSV 和复核文件；Pilot 机器通过不等于专家批准。
+命令会打印 `outputs/test/<run-id>/omop-trans.csv`。请查看 CSV 和复核文件；Pilot 机器通过不等于专家批准。
 
 ## 使用示例
 
@@ -101,13 +102,21 @@ concept_id~concept_name_zh~concept_name~domain_id~vocabulary_id~concept_class_id
 
 `concept_id` 必须是唯一的非负整数。程序先校验整份输入再选择目标词表，保留目标行原始字段。已有中文名、Athena 缺失或失效、词表身份冲突的记录不会发送。
 
-每次运行按目标输入顺序生成九列 `outputs/<run-id>/omop-trans.csv`：
+正式运行写入 `outputs/<run-id>/omop-trans.csv`，Pilot 写入 `outputs/test/<run-id>/omop-trans.csv`；两者均按目标输入顺序生成以下九列：
 
 ```text
 concept_id~concept_name_zh~concept_name~domain_id~vocabulary_id~concept_class_id~candidate_name_zh~review_status~model_name
 ```
 
 `candidate_name_zh` 是候选，`concept_name_zh` 保持原始正式字段。非空候选在后检通过或需要复核时标为 `pending_expert`；后检失败仍保留证据，不自动接受。`model_name` 优先记录响应报告的实际模型，否则记录请求模型。每个运行目录还有 `run_manifest.json`、`state.duckdb` 和复核/异常 CSV。`report` 只汇总兼容的正式运行，不合并 Pilot，生成 `outputs/omop-trans-all.csv` 与 `outputs/llm-trans-report.md`。
+
+`outputs/run-index.json` 按 run-id 记录运行类型、词表、用途、相对路径、状态及模型。仅在实际模型唯一时填写 `model_name`；`models_used` 保留调用台账与已保存成功行中的全部模型。程序在创建、续跑和结束时加锁并原子更新索引；索引缺失或损坏时可依据清单与 DuckDB 状态恢复：
+
+```powershell
+uv run --locked python -m llm_omop_trans.run_index
+```
+
+旧版位于 `outputs/<run-id>/` 的 Pilot 仍可读取和续跑。缺少类型字段的旧运行标为 `unknown`，不凭目录名推测。输出与索引均为 Git 忽略的本地运行产物。
 
 ## 项目结构
 
@@ -118,6 +127,7 @@ llm-omop-trans/
 │   ├── llm_trans.py    # CLI、预检、调用、Pilot、状态与导出
 │   ├── validator.py    # 14 类确定性医学属性检查
 │   ├── report.py       # 正式运行合并与质量报告
+│   ├── run_index.py    # 加锁运行索引与 Pilot 路径解析
 │   └── utils.py        # 严格 JSON 与哈希
 ├── llm_trans_main.py   # 兼容的 Python CLI 入口
 ├── examples/synthetic/ # 虚构输入与三个小型快照表
@@ -127,6 +137,15 @@ llm-omop-trans/
 ├── pyproject.toml
 ├── uv.toml
 └── uv.lock
+```
+
+运行输出结构：
+
+```text
+outputs/
+├── test/<run-id>/      # Pilot 清单、DuckDB 状态、CSV
+├── <run-id>/           # 正式运行清单、DuckDB 状态、CSV
+└── run-index.json      # 可重建的元数据索引
 ```
 
 ## 许可证

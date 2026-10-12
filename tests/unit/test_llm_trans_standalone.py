@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,7 @@ from langchain_core.runnables import Runnable
 import llm_omop_trans.config as standalone_config
 import llm_omop_trans.llm_trans as standalone
 import llm_omop_trans.validator as standalone_validator
+from llm_omop_trans.run_index import rebuild_index
 
 
 def _write_table(path: Path, header: list[str], rows: list[list[str]]) -> None:
@@ -278,6 +280,29 @@ def test_pilot_resume_and_export_with_local_endpoint(
             pilot_only=True,
             pilot_size=2,
         )
+        assert pilot_output.parent.parent.name == "test"
+        index_path = tmp_path / "outputs" / "run-index.json"
+        pilot_id = pilot_output.parent.name
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert index["schema_version"] == 1
+        assert index["runs"][pilot_id]["output_dir"] == f"test/{pilot_id}"
+        assert index["runs"][pilot_id]["status"] == "completed"
+        assert index["runs"][pilot_id]["models_used"] == ["test-model"]
+        assert index["runs"][pilot_id]["model_call_counts"] == {
+            "test-model": 2
+        }
+        legacy_dir = tmp_path / "outputs" / pilot_id
+        pilot_output.parent.rename(legacy_dir)
+        legacy_output = standalone.llm_trans(
+            source,
+            "CUSTOM",
+            pilot_only=True,
+            pilot_size=2,
+            resume_run_id=pilot_id,
+        )
+        assert legacy_output.parent == legacy_dir
+        assert server.calls == Counter({1: 1, 2: 1})
+        legacy_dir.rename(pilot_output.parent)
         assert server.calls == Counter({1: 1, 2: 1})
         assert server.max_active <= 2
         with pilot_output.open(encoding="utf-8", newline="") as result:
@@ -296,6 +321,24 @@ def test_pilot_resume_and_export_with_local_endpoint(
             require_pilot=True,
         )
         assert output != pilot_output
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert index["runs"][pilot_id]["output_dir"] == f"test/{pilot_id}"
+        assert (
+            index["runs"][output.parent.name]["output_dir"]
+            == output.parent.name
+        )
+        assert index["runs"][output.parent.name]["status"] == "completed"
+        original_index = index_path.read_text(encoding="utf-8")
+        rebuild_index(tmp_path / "outputs")
+        assert index_path.read_text(encoding="utf-8") == original_index
+        index_path.write_text("{damaged", encoding="utf-8")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(
+                pool.map(
+                    lambda _: rebuild_index(tmp_path / "outputs"), range(8)
+                )
+            )
+        assert json.loads(index_path.read_text(encoding="utf-8")) == index
         assert server.calls == Counter({1: 1, 2: 1, 3: 1})
         resumed = standalone.llm_trans(
             source,
@@ -432,6 +475,16 @@ def test_model_switch_keeps_provenance_and_does_not_repeat_success(
         batch_size=1,
     )
     assert resumed == full_output
+    index = json.loads(
+        (tmp_path / "outputs" / "run-index.json").read_text(encoding="utf-8")
+    )
+    used = index["runs"][full_output.parent.name]["models_used"]
+    assert set(used) == {
+        "backend-model-a",
+        "backend-model-b",
+        "model-a",
+    }
+    assert index["runs"][full_output.parent.name]["model_name"] is None
     assert calls == Counter(
         {
             ("model-a", 1): 1,
@@ -994,7 +1047,7 @@ def test_failed_request_does_not_erase_committed_success(
                 pilot_size=2,
             )
         assert server.calls == Counter({1: 1, 2: 1})
-        output = next((tmp_path / "outputs").glob("run-*/omop-trans.csv"))
+        output = next((tmp_path / "outputs").glob("test/run-*/omop-trans.csv"))
         with output.open(encoding="utf-8", newline="") as result:
             pilot = list(csv.DictReader(result, delimiter="~"))
         assert pilot[0]["review_status"] == "pending_expert"

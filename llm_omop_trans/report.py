@@ -19,6 +19,7 @@ from llm_omop_trans.config import (
     OUTPUT_ROOT,
     StandaloneError,
 )
+from llm_omop_trans.run_index import pilot_directories
 from llm_omop_trans.utils import _sha256_file
 
 TASK_EXCLUDED = EXTERNAL_LLM_DENIED_VOCABULARY_IDS | {
@@ -82,7 +83,7 @@ def _load_runs(
 ) -> tuple[dict[str, Path], list[tuple[str, Path]]]:
     full: dict[str, Path] = {}
     all_runs: list[tuple[str, Path]] = []
-    for run_dir in sorted(output_root.glob("run-*")):
+    for run_dir in pilot_directories(output_root):
         manifest_path = run_dir / "run_manifest.json"
         state_path = run_dir / "state.duckdb"
         if not (manifest_path.is_file() and state_path.is_file()):

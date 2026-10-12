@@ -13,6 +13,7 @@ Use it only for a licensed, explicitly authorized terminology review workflow. T
 - Strict UTF-8, tilde-delimited input validation; exact vocabulary selection; same-snapshot identity, validity, and existing-label checks before transfer.
 - One concept per request, a fixed JSON schema, strict parsing, and deterministic checks of 14 medical attribute families. All candidates require expert review.
 - Separate Pilot runs of 1–20 eligible records, a machine gate, explicit Pilot selection, and reuse of verified Pilot successes in a full run.
+- Pilot results in `outputs/test/<run-id>/`, full results in `outputs/<run-id>/`, and a rebuildable `outputs/run-index.json` for run lookup.
 - DuckDB call ledger, per-call commits, verified CSV export, fingerprinted resume, and no repeat of committed successes. Fallback models are used only after identified quota exhaustion and a synthetic probe.
 - A report that merges compatible full runs and distinguishes API success, candidate generation, validation, and completion.
 
@@ -67,7 +68,7 @@ With `.env` configured, send **one invented record** to the authorized model:
 uv run --locked llm-omop-trans translate --input .\examples\synthetic\input.csv --vocabulary-id DEMO --pilot-only --pilot-size 1 --concurrency 1 --batch-size 1
 ```
 
-The command prints `outputs/<run-id>/omop-trans.csv`. Inspect the CSV and review files; a machine-valid Pilot is not expert approval.
+The command prints `outputs/test/<run-id>/omop-trans.csv`. Inspect the CSV and review files; a machine-valid Pilot is not expert approval.
 
 ## Examples
 
@@ -101,13 +102,21 @@ concept_id~concept_name_zh~concept_name~domain_id~vocabulary_id~concept_class_id
 
 `concept_id` is a unique nonnegative integer. The complete input is checked before vocabulary selection. The original fields are retained for selected rows. Existing Chinese names, missing or inactive Athena records, and conflicting vocabulary identities are skipped before network calls.
 
-Each run writes `outputs/<run-id>/omop-trans.csv` in selected-input order with nine columns:
+Full runs write `outputs/<run-id>/omop-trans.csv`; Pilot runs write `outputs/test/<run-id>/omop-trans.csv`. Both preserve selected-input order and the same nine columns:
 
 ```text
 concept_id~concept_name_zh~concept_name~domain_id~vocabulary_id~concept_class_id~candidate_name_zh~review_status~model_name
 ```
 
 `candidate_name_zh` is a proposal; `concept_name_zh` remains the original field. A nonempty candidate passing or requiring review gets `pending_expert`; failed checks remain as evidence and are not accepted. `model_name` records the actual response model when supplied, otherwise the requested model. Each run also stores `run_manifest.json`, `state.duckdb`, and review/exception CSVs. `report` writes `outputs/omop-trans-all.csv` and `outputs/llm-trans-report.md` from compatible full runs, excluding Pilot-only runs.
+
+`outputs/run-index.json` maps each run ID to its type, vocabulary, purpose, relative output path, status, and recorded models. `model_name` is set only when one actual model is known; `models_used` preserves every model found in the call ledger or saved successful rows. The file is rebuilt under a lock and replaced atomically when a run starts, resumes, or ends. If it is missing or damaged, rebuild it from manifests and DuckDB state with:
+
+```powershell
+uv run --locked python -m llm_omop_trans.run_index
+```
+
+Older Pilot directories under `outputs/<run-id>/` remain readable and resumable. The index marks older runs without a recorded type as `unknown` instead of guessing. Outputs and the index are local artifacts ignored by Git.
 
 ## Project Structure
 
@@ -118,6 +127,7 @@ llm-omop-trans/
 │   ├── llm_trans.py    # CLI, preflight, calls, Pilot, state, export
 │   ├── validator.py    # 14 deterministic attribute checks
 │   ├── report.py       # full-run merge and quality report
+│   ├── run_index.py    # lock-protected run index and Pilot paths
 │   └── utils.py        # strict JSON and hashing
 ├── llm_trans_main.py   # compatible Python CLI entry
 ├── examples/synthetic/ # invented input and three tiny snapshot tables
@@ -127,6 +137,15 @@ llm-omop-trans/
 ├── pyproject.toml
 ├── uv.toml
 └── uv.lock
+```
+
+Runtime output layout:
+
+```text
+outputs/
+├── test/<run-id>/      # Pilot manifest, DuckDB state, CSV
+├── <run-id>/           # full-run manifest, DuckDB state, CSV
+└── run-index.json      # rebuildable metadata index
 ```
 
 ## License
