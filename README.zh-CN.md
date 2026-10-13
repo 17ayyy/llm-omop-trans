@@ -45,7 +45,19 @@ Copy-Item .env.example .env
 | `LLM_BASE_URL` | 兼容 OpenAI 的纯 HTTP(S) 基础地址，通常以 `/v1` 结尾；不能包含凭据、查询或片段。 |
 | `LLM_MODEL`、`LLM_API_KEY` | 默认模型与密钥；`LLM_MODEL_API_KEY` 是旧别名，两者同时设置时优先使用 `LLM_API_KEY`。 |
 | `LLM_TIMEOUT_SECONDS` | 单次请求超时，默认 `60` 秒，有效范围 `(0, 3600]`。 |
-| `LLM_TRANS_THINKING_MODE` | 可选的端点专有 `thinking.type`；仅在端点支持时设置。`adaptive` 还会启用 MiniMax 思考内容分离。 |
+| `LLM_TRANS_THINKING_MODE` | 默认 `auto`：仅对文档确认支持的官方端点与模型显式禁用。`disabled` 强制禁用，不支持时联网前报错；`provider_default` 不发送思考字段。`enabled`、`adaptive`、`low` 仅适用于支持型号。 |
+
+| 厂商 | `auto` 可关闭的模型 | 请求参数 | 限制与官方文档 |
+| --- | --- | --- | --- |
+| DeepSeek | `deepseek-flash`、`deepseek-v4-pro` | `thinking.type=disabled` | [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion) |
+| Qwen | 代码列出的 Qwen 3.5–3.8 混合思考模型，如 `qwen3.7-plus` | `enable_thinking=false` | 纯思考模型不能关闭；[思考模式](https://platform.qianwenai.com/docs/developer-guides/text-generation/thinking) |
+| MiniMax | `MiniMax-M3` | `thinking.type=disabled` | M2.x 忽略此参数；M3.1 Flash Preview 拒绝禁用，可选 `low`；[Chat Completions](https://platform.minimax.cn/docs/api-reference/text-chat-openai) |
+| StepFun | 无 | 无 | 支持型号可选 `reasoning_effort=low`，不能保证关闭；[Chat Completions](https://platform.stepfun.ai/docs/en/api-reference/chat/chat-completion-create) |
+| Agnes | 无 | 无 | 仅 `agnes-2.5-flash` 的 `enabled` 有文档依据，禁用未证实；[Flash](https://agnes-ai.cn/zh-Hans/docs/agnes-25-flash) |
+| Gemini | `gemini-2.5-flash`、`gemini-2.5-flash-lite` | `reasoning_effort=none` | Pro 与 Gemini 3 不能关闭，支持型号可选 `low`；[OpenAI 兼容接口](https://ai.google.dev/gemini-api/docs/openai) |
+| OpenAI | 代码列出的 `gpt-5.1`、`gpt-5.5`、`gpt-5.6-*`、`gpt-6-sol/luna` | `reasoning_effort=none` | `gpt-6-astra`、`gpt-6.1-sol` 仅支持 `low` 等非关闭级别；[Reasoning](https://developers.openai.com/api/docs/guides/reasoning) |
+
+只对代码列出的模型 ID 和官方域名/路径应用参数；第三方 OpenAI 兼容代理不自动继承。`adaptive` 仅对 MiniMax-M3 发送 `thinking.type=adaptive` 和 `reasoning_split=true`。未知组合发出警告并保留厂商默认值，不能视为已关闭思考。新成功记录把实际思考参数写入指纹；旧成功记录仍按历史指纹复核，续跑不重译。本地 Mock 已验证请求构造；真实 API、Token 节省和延迟尚未验证。
 
 执行 `uv run llm-omop-trans translate --help` 可查看全部参数。主要参数如下：
 

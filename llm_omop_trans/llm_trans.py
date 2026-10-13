@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import uuid
+import warnings
 from collections.abc import Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from dataclasses import replace as dataclass_replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import cast
+from urllib.parse import urlsplit
 
 import duckdb
 import httpx
@@ -553,9 +555,172 @@ def _build_request(row: EnrichedRow) -> LlmConceptRequest:
     )
 
 
+_QWEN_SWITCHABLE_MODELS = {
+    "qwen3.8-max",
+    "qwen3.8-max-0902",
+    "qwen3.8-flash",
+    "qwen3.8-27b",
+    "qwen3.8-omni-flash",
+    "qwen3.7-max",
+    "qwen3.7-max-2026-06-08",
+    "qwen3.7-max-2026-05-20",
+    "qwen3.7-plus",
+    "qwen3.7-plus-2026-05-26",
+    "qwen3.7-flash",
+    "qwen3.7-flash-2026-07-15",
+    "qwen3.6-plus",
+    "qwen3.6-plus-2026-04-02",
+    "qwen3.6-flash",
+    "qwen3.6-flash-2026-04-16",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+}
+_OPENAI_NO_REASONING_MODELS = {
+    "gpt-5.1",
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-6-sol",
+    "gpt-6-luna",
+}
+_OPENAI_LOW_ONLY_MODELS = {"gpt-6-astra", "gpt-6.1-sol"}
+_GEMINI_NO_REASONING_MODELS = {
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+}
+_GEMINI_LOW_MODELS = _GEMINI_NO_REASONING_MODELS | {
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.8-flash",
+}
+
+
+def _provider(config: RuntimeConfig) -> str | None:
+    """Identify only documented first-party Chat Completions endpoints."""
+    endpoint = urlsplit(config.base_url)
+    if endpoint.scheme != "https" or endpoint.port not in {None, 443}:
+        return None
+    host = endpoint.hostname
+    path = endpoint.path.rstrip("/")
+    if host == "api.deepseek.com" and path in {"", "/v1"}:
+        return "deepseek"
+    if (
+        host in {"maas.qianwenaiapi.com", "dashscope.aliyuncs.com"}
+        and path == "/compatible-mode/v1"
+    ):
+        return "qwen"
+    if host in {"api.minimax.cn", "api.minimaxi.com"} and path == "/v1":
+        return "minimax"
+    if host in {"api.stepfun.com", "api.stepfun.ai"} and path == "/v1":
+        return "stepfun"
+    if host == "api.agnes-ai.cn" and path == "/v1":
+        return "agnes"
+    if host == "generativelanguage.googleapis.com" and path == "/v1beta/openai":
+        return "gemini"
+    if host == "api.openai.com" and path == "/v1":
+        return "openai"
+    return None
+
+
+def _can_disable(config: RuntimeConfig) -> bool:
+    provider = _provider(config)
+    model = config.model
+    return (
+        provider == "deepseek"
+        and model in {"deepseek-flash", "deepseek-v4-pro"}
+        or provider == "qwen"
+        and model in _QWEN_SWITCHABLE_MODELS
+        or provider == "minimax"
+        and model == "MiniMax-M3"
+        or provider == "gemini"
+        and model in _GEMINI_NO_REASONING_MODELS
+        or provider == "openai"
+        and model in _OPENAI_NO_REASONING_MODELS
+    )
+
+
+def _reasoning_parameters(config: RuntimeConfig) -> dict[str, object]:
+    """Return the documented wire parameters for this endpoint and model."""
+    mode = config.thinking_mode
+    if mode in {None, "auto", "provider_default"}:
+        return {}
+    provider = _provider(config)
+    model = config.model
+    if mode == "disabled":
+        if not _can_disable(config):
+            raise StandaloneError(
+                "Thinking cannot be confirmed disabled for "
+                f"{model} at this endpoint"
+            )
+        if provider in {"deepseek", "minimax"}:
+            return {"extra_body": {"thinking": {"type": "disabled"}}}
+        if provider == "qwen":
+            return {"extra_body": {"enable_thinking": False}}
+        return {"reasoning_effort": "none"}
+    if mode in {"enabled", "adaptive"}:
+        if provider == "minimax" and model == "MiniMax-M3":
+            return {
+                "extra_body": {
+                    "thinking": {"type": "adaptive"},
+                    "reasoning_split": True,
+                }
+            }
+        if mode == "adaptive":
+            raise StandaloneError(
+                "adaptive thinking is only supported for MiniMax-M3"
+            )
+        if provider == "deepseek" and model in {
+            "deepseek-flash",
+            "deepseek-v4-pro",
+        }:
+            return {"extra_body": {"thinking": {"type": "enabled"}}}
+        if provider == "qwen" and model in _QWEN_SWITCHABLE_MODELS:
+            return {"extra_body": {"enable_thinking": True}}
+        if provider == "agnes" and model == "agnes-2.5-flash":
+            return {
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": True}
+                }
+            }
+        if provider == "gemini" and model in _GEMINI_NO_REASONING_MODELS:
+            return {"reasoning_effort": "low"}
+        if provider == "openai" and model in _OPENAI_NO_REASONING_MODELS:
+            return {"reasoning_effort": "low"}
+    if mode == "low":
+        if (
+            provider == "stepfun"
+            and model
+            in {
+                "step-3.7-flash",
+                "step-5-preview",
+                "step-3.5-flash",
+                "step-3.5-flash-2603",
+            }
+            or provider == "minimax"
+            and model == "MiniMax-M3.1-Flash-Preview"
+            or provider == "gemini"
+            and model in _GEMINI_LOW_MODELS
+            or provider == "openai"
+            and model in (_OPENAI_NO_REASONING_MODELS | _OPENAI_LOW_ONLY_MODELS)
+        ):
+            return {"reasoning_effort": "low"}
+    raise StandaloneError(
+        f"Thinking mode {mode!r} is unsupported for {model} at this endpoint"
+    )
+
+
 def _request_fingerprint(
     request: LlmConceptRequest,
     config: RuntimeConfig,
+    *,
+    legacy: bool = False,
 ) -> str:
     """Bind a request to model, endpoint, prompt, schema, and validator."""
     payload = {
@@ -570,7 +735,36 @@ def _request_fingerprint(
     }
     if config.model == "MiniMax-M3" and config.thinking_mode == "adaptive":
         payload["reasoning_split"] = True
+    if not legacy:
+        payload["reasoning_parameters"] = _reasoning_parameters(config)
     return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
+
+
+def _configure_request(config: RuntimeConfig) -> RuntimeConfig:
+    """Select documented settings and reject unsupported explicit modes."""
+    mode = config.thinking_mode
+    if mode not in {
+        None,
+        "auto",
+        "disabled",
+        "enabled",
+        "adaptive",
+        "low",
+        "provider_default",
+    }:
+        raise StandaloneError("Invalid LLM_TRANS_THINKING_MODE")
+    if mode in {None, "auto"}:
+        if _can_disable(config):
+            config = dataclass_replace(config, thinking_mode="disabled")
+        else:
+            warnings.warn(
+                "Thinking disable is unverified or unsupported for "
+                f"{config.model}; provider default retained",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+    _reasoning_parameters(config)
+    return config
 
 
 class _ResponseError(ValueError):
@@ -625,13 +819,7 @@ def _build_chain(
     config: RuntimeConfig,
 ) -> Runnable[dict[str, str], ParsedResponse]:
     """Build the LangChain prompt, Chat Completions model, and strict parser."""
-    extra_body = (
-        {"thinking": {"type": config.thinking_mode}}
-        if config.thinking_mode
-        else None
-    )
-    if config.model == "MiniMax-M3" and config.thinking_mode == "adaptive":
-        extra_body = {**extra_body, "reasoning_split": True}
+    parameters = _reasoning_parameters(config)
     model = ChatOpenAI(
         model=config.model,
         api_key=SecretStr(config.api_key),
@@ -641,7 +829,8 @@ def _build_chain(
         max_retries=0,
         streaming=False,
         use_responses_api=False,
-        extra_body=extra_body,
+        extra_body=parameters.get("extra_body"),
+        reasoning_effort=cast(str | None, parameters.get("reasoning_effort")),
     )
     prompt = ChatPromptTemplate.from_messages(
         [("system", _SYSTEM_PROMPT), ("human", "{user_content}")]
@@ -860,12 +1049,15 @@ def _resolve_resume_semantic(
         return semantic
     if re.fullmatch(r"run-[0-9a-f]{16}", resume_run_id) is None:
         raise StandaloneError("Invalid resume run ID")
-    path = run_directory(
-        OUTPUT_ROOT,
-        resume_run_id,
-        str(semantic.get("run_kind")),
-        resume=True,
-    ) / "run_manifest.json"
+    path = (
+        run_directory(
+            OUTPUT_ROOT,
+            resume_run_id,
+            str(semantic.get("run_kind")),
+            resume=True,
+        )
+        / "run_manifest.json"
+    )
     if not path.is_file():
         raise StandaloneError("Resume run is missing manifest")
     try:
@@ -1064,8 +1256,17 @@ def _check_resume(
                     "endpoint", legacy_endpoint or config.base_url
                 ),
             )
+            if "reasoning_parameters" in metadata and (
+                metadata["reasoning_parameters"]
+                != _reasoning_parameters(used_config)
+            ):
+                raise StandaloneError(
+                    "Success cache reasoning parameters do not match"
+                )
             if request_fp != _request_fingerprint(
-                _build_request(row), used_config
+                _build_request(row),
+                used_config,
+                legacy="reasoning_parameters" not in metadata,
             ):
                 raise StandaloneError(
                     "Success cache request fingerprint does not match"
@@ -1180,13 +1381,11 @@ def _persist_outcome(
     row: EnrichedRow,
     request_fp: str,
     outcome: CallOutcome,
-    model_name: str,
-    thinking_mode: str | None,
-    endpoint: str,
+    config: RuntimeConfig,
 ) -> None:
     """Commit response, validation, status, and call ledger atomically."""
     candidate, review = _decide_status(outcome)
-    actual_model = outcome.model_name or model_name
+    actual_model = outcome.model_name or config.model
     tech = "succeeded" if outcome.candidate is not None else "failed"
     response_json = (
         _canonical_json(outcome.candidate.model_dump(mode="json"))
@@ -1206,9 +1405,10 @@ def _persist_outcome(
         "usage": outcome.usage,
         "call_id": outcome.call_id,
         "model_name": actual_model,
-        "requested_model": model_name,
-        "thinking_mode": thinking_mode,
-        "endpoint": endpoint,
+        "requested_model": config.model,
+        "thinking_mode": config.thinking_mode,
+        "endpoint": config.base_url,
+        "reasoning_parameters": _reasoning_parameters(config),
         "provider_error_code": outcome.provider_error_code,
     }
     connection.execute("BEGIN TRANSACTION")
@@ -1353,9 +1553,7 @@ def _process_batches(
                             row,
                             fingerprint,
                             outcome,
-                            config.model,
-                            config.thinking_mode,
-                            config.base_url,
+                            config,
                         )
                         processed_this_run += 1
                         if outcome.error_type is None:
@@ -1376,9 +1574,7 @@ def _process_batches(
                         row,
                         fingerprint,
                         outcome,
-                        config.model,
-                        config.thinking_mode,
-                        config.base_url,
+                        config,
                     )
                 return "interrupted"
             print(
@@ -1603,8 +1799,17 @@ def _seed_pilot_successes(
                 used_config = dataclass_replace(
                     config, model=requested, thinking_mode=thinking
                 )
+                if "reasoning_parameters" in metadata and (
+                    metadata["reasoning_parameters"]
+                    != _reasoning_parameters(used_config)
+                ):
+                    raise StandaloneError(
+                        "Pilot reasoning parameters do not match"
+                    )
                 if fingerprint != _request_fingerprint(
-                    _build_request(by_seq[seq]), used_config
+                    _build_request(by_seq[seq]),
+                    used_config,
+                    legacy="reasoning_parameters" not in metadata,
                 ):
                     raise StandaloneError(
                         "Pilot request fingerprint does not match current code"
@@ -1709,6 +1914,7 @@ def llm_trans(
         if not model_name.strip() or re.search(r"[\x00-\x1f]", model_name):
             raise StandaloneError("model_name must be nonempty plain text")
         config = dataclass_replace(config, model=model_name)
+    config = _configure_request(config)
     input_csv = Path(input_csv).expanduser().resolve()
     selected, total, input_hash = _validate_input(
         input_csv,
@@ -1865,7 +2071,7 @@ def _probe_model(config: RuntimeConfig) -> CallOutcome:
         concept_class_id="Clinical Finding",
         input_fingerprint="synthetic-probe",
     )
-    return _invoke_with_retry(_build_chain(config), request)
+    return _invoke_with_retry(_build_chain(_configure_request(config)), request)
 
 
 def _record_model_probe(

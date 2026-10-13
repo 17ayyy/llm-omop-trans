@@ -45,7 +45,19 @@ Edit `.env` with an authorized endpoint, model, and key. It initially points to 
 | `LLM_BASE_URL` | Plain HTTP(S) OpenAI-compatible base URL, normally ending in `/v1`; no credentials, query, or fragment. |
 | `LLM_MODEL`, `LLM_API_KEY` | Default model and secret. `LLM_MODEL_API_KEY` is a legacy fallback alias; `LLM_API_KEY` wins. |
 | `LLM_TIMEOUT_SECONDS` | Per-request timeout, default `60`, valid range `(0, 3600]`. |
-| `LLM_TRANS_THINKING_MODE` | Optional provider-specific `thinking.type`; leave unset unless supported. `adaptive` also enables MiniMax reasoning separation. |
+| `LLM_TRANS_THINKING_MODE` | `auto` by default: explicitly disable only for documented first-party endpoint/model pairs. `disabled` fails before a request if unsupported; `provider_default` sends no reasoning field. `enabled`, `adaptive`, and `low` require model support. |
+
+| Provider | Models with explicit disable in `auto` | Request field | Limitation and official source |
+| --- | --- | --- | --- |
+| DeepSeek | `deepseek-flash`, `deepseek-v4-pro` | `thinking.type=disabled` | [Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion) |
+| Qwen | Listed hybrid Qwen 3.5–3.8 models, e.g. `qwen3.7-plus` | `enable_thinking=false` | Pure thinking models cannot turn it off; [thinking mode](https://platform.qianwenai.com/docs/developer-guides/text-generation/thinking) |
+| MiniMax | `MiniMax-M3` | `thinking.type=disabled` | M2.x ignores it; M3.1 Flash Preview rejects it and supports `low` instead; [Chat Completions](https://platform.minimax.cn/docs/api-reference/text-chat-openai) |
+| StepFun | None | None | Supported models offer `reasoning_effort=low`, not off; [Chat Completions](https://platform.stepfun.ai/docs/en/api-reference/chat/chat-completion-create) |
+| Agnes | None | None | `agnes-2.5-flash` documents `enabled`, but disabling is unverified; [Flash](https://agnes-ai.cn/zh-Hans/docs/agnes-25-flash) |
+| Gemini | `gemini-2.5-flash`, `gemini-2.5-flash-lite` | `reasoning_effort=none` | Pro and Gemini 3 cannot turn it off; supported models may use `low`; [OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai) |
+| OpenAI | Listed `gpt-5.1`, `gpt-5.5`, `gpt-5.6-*`, `gpt-6-sol/luna` | `reasoning_effort=none` | `gpt-6-astra` and `gpt-6.1-sol` support `low` but not `none`; [reasoning](https://developers.openai.com/api/docs/guides/reasoning) |
+
+Only the model IDs and official endpoint paths listed in code inherit these semantics. OpenAI-compatible proxies do not automatically qualify. `adaptive` sends `thinking.type=adaptive` and `reasoning_split=true` only for MiniMax-M3. Unsupported defaults emit a warning and keep the provider default; that is not proof of disabled reasoning. New successful rows fingerprint the actual reasoning fields; historical successful rows keep their legacy fingerprints and are not retranslated. Local Mock tests verify request construction; real provider API behavior, token savings, and latency remain unverified.
 
 `uv run llm-omop-trans translate --help` lists every flag. Key options:
 

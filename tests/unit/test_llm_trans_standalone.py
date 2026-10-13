@@ -288,9 +288,7 @@ def test_pilot_resume_and_export_with_local_endpoint(
         assert index["runs"][pilot_id]["output_dir"] == f"test/{pilot_id}"
         assert index["runs"][pilot_id]["status"] == "completed"
         assert index["runs"][pilot_id]["models_used"] == ["test-model"]
-        assert index["runs"][pilot_id]["model_call_counts"] == {
-            "test-model": 2
-        }
+        assert index["runs"][pilot_id]["model_call_counts"] == {"test-model": 2}
         legacy_dir = tmp_path / "outputs" / pilot_id
         pilot_output.parent.rename(legacy_dir)
         legacy_output = standalone.llm_trans(
@@ -850,6 +848,63 @@ def test_success_cache_corruption_blocks_resume(
     assert config.model == "test-model"
 
 
+def test_legacy_success_resumes_without_another_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old successful rows keep their historical request fingerprints."""
+    source, config = _fixture(tmp_path, monkeypatch, "http://127.0.0.1:9/v1")
+    calls = 0
+
+    class FakeChain:
+        def invoke(self, _payload: object) -> standalone.ParsedResponse:
+            nonlocal calls
+            calls += 1
+            return standalone.ParsedResponse(
+                standalone.LlmCandidateResponse(
+                    concept_name_zh="左侧肾脏",
+                    alternatives=[],
+                    preserved_modifiers=[],
+                    ambiguity_flags=[],
+                    missing_information=[],
+                    needs_review=True,
+                ),
+                {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            )
+
+    monkeypatch.setattr(standalone, "_build_chain", lambda _: FakeChain())
+    output = standalone.llm_trans(
+        source, "CUSTOM", pilot_only=True, pilot_size=1
+    )
+    original = output.read_bytes()
+    selected, _, _ = standalone._validate_input(source, "CUSTOM")
+    row = standalone._enrich_targets(selected, config)[0]
+    legacy_fp = standalone._request_fingerprint(
+        standalone._build_request(row), config, legacy=True
+    )
+    connection = duckdb.connect(str(output.parent / "state.duckdb"))
+    metadata_json = connection.execute(
+        "SELECT metadata_json FROM targets WHERE seq=1"
+    ).fetchone()[0]
+    metadata = json.loads(metadata_json)
+    metadata.pop("reasoning_parameters")
+    connection.execute(
+        "UPDATE targets SET request_fp=?, metadata_json=? WHERE seq=1",
+        [legacy_fp, json.dumps(metadata)],
+    )
+    connection.execute("UPDATE calls SET request_fp=? WHERE seq=1", [legacy_fp])
+    connection.close()
+    resumed = standalone.llm_trans(
+        source,
+        "CUSTOM",
+        pilot_only=True,
+        pilot_size=1,
+        resume_run_id=output.parent.name,
+    )
+    assert resumed.read_bytes() == original
+    assert calls == 1
+
+
 def test_retry_only_transient_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -940,8 +995,9 @@ def test_explicit_thinking_option_reaches_chat_completions_mock(
         selected, _, _ = standalone._validate_input(source, "CUSTOM")
         enriched = standalone._enrich_targets(selected, config)
         request = standalone._build_request(enriched[0])
+        monkeypatch.setattr(standalone, "_provider", lambda _: "deepseek")
         chain = standalone._build_chain(
-            replace(config, thinking_mode="disabled")
+            replace(config, model="deepseek-flash", thinking_mode="disabled")
         )
         response = chain.invoke(
             {
@@ -997,6 +1053,143 @@ def test_provider_http_retry_classification(
         thread.join(timeout=3)
 
 
+@pytest.mark.parametrize(
+    ("provider", "model", "mode", "expected"),
+    [
+        ("qwen", "qwen3.7-plus", None, {"enable_thinking": False}),
+        ("qwen", "qwen3.7-plus", "enabled", {"enable_thinking": True}),
+        ("minimax", "MiniMax-M3", None, {"thinking": {"type": "disabled"}}),
+        (
+            "minimax",
+            "MiniMax-M3",
+            "adaptive",
+            {"thinking": {"type": "adaptive"}, "reasoning_split": True},
+        ),
+        (
+            "minimax",
+            "MiniMax-M3.1-Flash-Preview",
+            "low",
+            {"reasoning_effort": "low"},
+        ),
+        ("stepfun", "step-3.7-flash", "low", {"reasoning_effort": "low"}),
+        (
+            "agnes",
+            "agnes-2.5-flash",
+            "enabled",
+            {"chat_template_kwargs": {"enable_thinking": True}},
+        ),
+        ("gemini", "gemini-2.5-flash", None, {"reasoning_effort": "none"}),
+        ("gemini", "gemini-3.8-flash", "low", {"reasoning_effort": "low"}),
+        ("openai", "gpt-6-luna", None, {"reasoning_effort": "none"}),
+        ("openai", "gpt-6-astra", "low", {"reasoning_effort": "low"}),
+    ],
+)
+def test_provider_reasoning_request_matrix_with_local_mock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    model: str,
+    mode: str | None,
+    expected: dict[str, object],
+) -> None:
+    """Send only documented reasoning fields in the Chat Completions body."""
+    from dataclasses import replace
+
+    server = _Server()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        _, config = _fixture(
+            tmp_path, monkeypatch, f"http://127.0.0.1:{server.server_port}/v1"
+        )
+        monkeypatch.setattr(standalone, "_provider", lambda _: provider)
+        configured = standalone._configure_request(
+            replace(config, model=model, thinking_mode=mode)
+        )
+        assert standalone._probe_model(configured).error_type is None
+        payload = server.payloads[0]
+        for key, value in expected.items():
+            assert payload[key] == value
+        for key in {
+            "thinking",
+            "enable_thinking",
+            "chat_template_kwargs",
+            "reasoning_effort",
+        } - expected.keys():
+            assert key not in payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("qwen", "qwen3.7-max-preview"),
+        ("minimax", "MiniMax-M2.7"),
+        ("minimax", "MiniMax-M3.1-Flash-Preview"),
+        ("stepfun", "step-3.7-flash"),
+        ("agnes", "agnes-2.5-flash"),
+        ("gemini", "gemini-2.5-pro"),
+        ("gemini", "gemini-3.8-flash"),
+        ("openai", "gpt-6-astra"),
+    ],
+)
+def test_unsupported_explicit_disable_fails_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    model: str,
+) -> None:
+    """Reject disable requests which a provider ignores or does not support."""
+    from dataclasses import replace
+
+    _, config = _fixture(tmp_path, monkeypatch, "http://127.0.0.1:1/v1")
+    monkeypatch.setattr(standalone, "_provider", lambda _: provider)
+    with pytest.raises(
+        standalone_config.StandaloneError, match="cannot be confirmed disabled"
+    ):
+        standalone._configure_request(
+            replace(config, model=model, thinking_mode="disabled")
+        )
+    with pytest.warns(RuntimeWarning, match="unverified or unsupported"):
+        defaulted = standalone._configure_request(replace(config, model=model))
+    assert standalone._reasoning_parameters(defaulted) == {}
+
+
+def test_provider_matching_requires_official_host_and_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proxy host must not inherit first-party parameter semantics."""
+    from dataclasses import replace
+
+    _, config = _fixture(tmp_path, monkeypatch, "http://127.0.0.1:1/v1")
+    for endpoint, provider in [
+        ("https://maas.qianwenaiapi.com/compatible-mode/v1", "qwen"),
+        ("https://api.minimax.cn/v1", "minimax"),
+        ("https://api.stepfun.com/v1", "stepfun"),
+        ("https://api.agnes-ai.cn/v1", "agnes"),
+        ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini"),
+        ("https://api.openai.com/v1", "openai"),
+    ]:
+        assert (
+            standalone._provider(replace(config, base_url=endpoint)) == provider
+        )
+    assert (
+        standalone._provider(
+            replace(config, base_url="https://api.openai.com.evil.test/v1")
+        )
+        is None
+    )
+    assert (
+        standalone._provider(
+            replace(config, base_url="http://api.openai.com/v1")
+        )
+        is None
+    )
+
+
 def test_prompt_and_validator_contract_without_source_project() -> None:
     """Keep request serialization and medical checks self-contained."""
     request = standalone.LlmConceptRequest(
@@ -1016,9 +1209,12 @@ def test_prompt_and_validator_contract_without_source_project() -> None:
     assert '"concept_id":12' in user_content
     assert '"concept_name":"Left kidney"' in user_content
     assert len(standalone_validator.CandidateAttribute) == 14
-    assert standalone_validator.validate_candidate(
-        "HIV negative", "HIV阳性"
-    ).validation_status == standalone_validator.ValidationStatus.FAIL
+    assert (
+        standalone_validator.validate_candidate(
+            "HIV negative", "HIV阳性"
+        ).validation_status
+        == standalone_validator.ValidationStatus.FAIL
+    )
 
 
 def test_failed_request_does_not_erase_committed_success(
@@ -1133,6 +1329,30 @@ def test_runtime_reads_existing_key_names_without_logging(
     assert expected not in repr(runtime)
 
 
+def test_thinking_mode_config_parsing_and_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Normalize supported modes and reject typos before API requests."""
+    values = {
+        "OMOP_CONCEPT_PATH": str(tmp_path / "CONCEPT.csv"),
+        "OMOP_CONCEPT_SYNONYM_PATH": str(tmp_path / "CONCEPT_SYNONYM.csv"),
+        "OMOP_VOCABULARY_PATH": str(tmp_path / "VOCABULARY.csv"),
+        "OMOP_ATHENA_RELEASE": "synthetic",
+        "OMOP_EFFECTIVE_DATE": "2026-01-01",
+        "LLM_BASE_URL": "https://example.invalid/v1",
+        "LLM_MODEL": "local-test-model",
+        "LLM_API_KEY": "local-test-key",
+        "LLM_TRANS_THINKING_MODE": "  LOW ",
+    }
+    monkeypatch.setattr(standalone_config, "_env_values", lambda: values)
+    assert standalone_config._load_runtime().thinking_mode == "low"
+    values["LLM_TRANS_THINKING_MODE"] = "unsupported"
+    with pytest.raises(
+        standalone_config.StandaloneError, match="THINKING_MODE"
+    ):
+        standalone_config._load_runtime()
+
+
 @pytest.mark.parametrize(
     "vocabulary_id",
     sorted(
@@ -1236,7 +1456,7 @@ def test_endpoint_switch_preserves_old_success_and_requires_pilot(
         old_config,
         base_url="https://new.example/v1",
         model="new-model",
-        thinking_mode="disabled",
+        thinking_mode="provider_default",
     )
     pilot = standalone.llm_trans(
         source,
@@ -1325,6 +1545,7 @@ def test_minimax_adaptive_reasoning_is_split_and_fingerprinted(
             monkeypatch,
             f"http://127.0.0.1:{server.server_port}/v1",
         )
+        monkeypatch.setattr(standalone, "_provider", lambda _: "minimax")
         adaptive = replace(config, model="MiniMax-M3", thinking_mode="adaptive")
         outcome = standalone._probe_model(adaptive)
         assert outcome.error_type is None

@@ -142,6 +142,19 @@ def _load_runtime() -> RuntimeConfig:
         ) from error
     if not 0 < timeout <= 3600:
         raise StandaloneError("LLM_TIMEOUT_SECONDS must be in (0, 3600]")
+    thinking_mode = (
+        values.get("LLM_TRANS_THINKING_MODE", "").strip().lower() or None
+    )
+    if thinking_mode not in {
+        None,
+        "auto",
+        "disabled",
+        "enabled",
+        "adaptive",
+        "low",
+        "provider_default",
+    }:
+        raise StandaloneError("Invalid LLM_TRANS_THINKING_MODE")
     base_url = required("LLM_BASE_URL").rstrip("/")
     endpoint = urlsplit(base_url)
     if (
@@ -170,5 +183,5 @@ def _load_runtime() -> RuntimeConfig:
             or required("LLM_MODEL_API_KEY")
         ),
         timeout_seconds=timeout,
-        thinking_mode=values.get("LLM_TRANS_THINKING_MODE") or None,
+        thinking_mode=thinking_mode,
     )
