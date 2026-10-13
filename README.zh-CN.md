@@ -91,6 +91,8 @@ uv run --locked llm-omop-trans report --input .\rawdata\authorized-input.csv
 
 请将占位符替换为获授权的真实路径、词表、模型和 run-id。合成样例的单条 Pilot 及续跑已经验证；真实数据命令是使用模板，不代表已获得真实数据外发授权。
 
+连通性检查、Pilot、正式运行、续跑及报告的分步操作见[使用指南](docs/usage.md)。
+
 ## 输入输出
 
 输入为 UTF-8、`~` 分隔 CSV，表头及**七列顺序必须完全一致**：
